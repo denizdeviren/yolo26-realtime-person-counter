@@ -176,10 +176,10 @@ st.markdown("""
 
 
 # ==============================================================================
-# ONNX Runtime ile YOLOv8 Inference (PyTorch gerektirmez!)
+# ONNX Runtime ile YOLO26 Inference (PyTorch gerektirmez!)
 # ==============================================================================
-class YOLOv8ONNX:
-    """YOLOv8 ONNX modelini çalıştırır — torch/ultralytics gerektirmez."""
+class YOLO26ONNX:
+    """YOLO26 ONNX modelini çalıştırır — torch/ultralytics gerektirmez."""
 
     # COCO sınıf isimleri — sadece 'person' (index 0) kullanılacak
     PERSON_CLASS_ID = 0
@@ -223,7 +223,7 @@ class YOLOv8ONNX:
 
     def postprocess(self, output):
         """ONNX çıktısını bounding box'lara dönüştür."""
-        # YOLOv8 çıktısı: (1, 84, N) — 84 = 4 (box) + 80 (classes)
+        # YOLO26 çıktısı: (1, 84, N) — 84 = 4 (box) + 80 (classes)
         predictions = output[0]  # (1, 84, N)
         predictions = predictions[0]  # (84, N)
         predictions = predictions.T  # (N, 84)
@@ -267,7 +267,7 @@ class YOLOv8ONNX:
 
         result = []
         for i in indices:
-            result.append((int(x1[i]), int(y1[i]), int(x2[i]), int(y2[i])))
+            result.append((int(x1[i]), int(y1[i]), int(x2[i]), int(y2[i]), float(scores[i])))
 
         return result
 
@@ -478,7 +478,7 @@ class CentroidTracker:
 def load_model():
     """ONNX modelini yükle."""
     model_path = os.path.join(os.path.dirname(__file__), "yolov8n.onnx")
-    return YOLOv8ONNX(model_path, conf_threshold=0.5, iou_threshold=0.45, input_size=416)
+    return YOLO26ONNX(model_path, conf_threshold=0.5, iou_threshold=0.45, input_size=416)
 
 
 # ==============================================================================
@@ -497,7 +497,7 @@ class PersonCounterProcessor(VideoProcessorBase):
         self._frame_count = 0
         self._last_rects = []
 
-    def draw_fancy_box(self, frame, x1, y1, x2, y2, obj_id):
+    def draw_fancy_box(self, frame, x1, y1, x2, y2, obj_id, conf=None):
         colors = [
             (99, 102, 241), (16, 185, 129), (245, 158, 11), (239, 68, 68),
             (139, 92, 246), (6, 182, 212), (236, 72, 153), (34, 197, 94),
@@ -521,7 +521,11 @@ class PersonCounterProcessor(VideoProcessorBase):
         cv2.line(frame, (x2, y2), (x2 - corner_len, y2), color_bgr, thickness + 1)
         cv2.line(frame, (x2, y2), (x2, y2 - corner_len), color_bgr, thickness + 1)
 
-        label = f"Kisi #{obj_id}"
+        # Etiket: Kişi ID + Güven Skoru
+        if conf is not None:
+            label = f"Kisi #{obj_id} %{int(conf * 100)}"
+        else:
+            label = f"Kisi #{obj_id}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         label_y = max(y1 - 8, th + 8)
         cv2.rectangle(frame, (x1, label_y - th - 8), (x1 + tw + 12, label_y + 4), color_bgr, -1)
@@ -562,16 +566,21 @@ class PersonCounterProcessor(VideoProcessorBase):
         # Performans: her 2. frame'de tespit yap
         if self._frame_count % 2 == 0:
             self.model.conf_threshold = self.confidence
-            rects = self.model.detect(img)
+            detections = self.model.detect(img)
+            # detections: [(x1, y1, x2, y2, conf), ...]
+            rects = [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in detections]
+            scores = {(x1, y1, x2, y2): conf for x1, y1, x2, y2, conf in detections}
             objects = self.tracker.update(rects)
 
             with self._lock:
                 self.current_count = len(objects)
                 self.total_count = self.tracker.total_confirmed
                 self._last_rects = rects
+                self._last_scores = scores
         else:
             with self._lock:
                 rects = self._last_rects
+                scores = getattr(self, '_last_scores', {})
             objects = self.tracker.objects
 
         for (object_id, centroid) in objects.items():
@@ -584,7 +593,8 @@ class PersonCounterProcessor(VideoProcessorBase):
                     min_d = d
                     best_rect = (x1, y1, x2, y2)
             if best_rect:
-                self.draw_fancy_box(img, *best_rect, object_id)
+                conf = scores.get(best_rect, None)
+                self.draw_fancy_box(img, *best_rect, object_id, conf)
             cv2.circle(img, (int(centroid[0]), int(centroid[1])), 4, (241, 102, 99), -1)
             cv2.circle(img, (int(centroid[0]), int(centroid[1])), 6, (241, 102, 99), 1)
 
@@ -627,7 +637,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## 🏷️ Model Bilgisi")
     st.markdown("""
-    - **Model:** YOLOv8 Nano (ONNX)
+    - **Model:** YOLO26 Nano (ONNX)
     - **Sınıf:** İnsan (person)
     - **Tracking:** Centroid-based
     - **Onay:** 4 frame doğrulama
