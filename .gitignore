@@ -131,7 +131,6 @@ cython_debug/
 
 # Model Weights (Do not push heavy weights to git)
 *.pt
-*.onnx
 *.engine
 
 # Operating System specific files
