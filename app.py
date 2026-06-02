@@ -610,47 +610,64 @@ with col_stats:
     total_placeholder = st.empty()
     status_placeholder = st.empty()
 
-    # Metrik kartları
-    if ctx.state.playing and ctx.video_processor:
-        current = ctx.video_processor.current_count
-        total = ctx.video_processor.total_count
-    else:
-        current = 0
-        total = 0
-
-    current_placeholder.markdown(f"""
+    # Metrik kartları (İlk durum / Beklemede)
+    current_placeholder.markdown("""
     <div class="metric-card current">
         <div class="icon">👥</div>
         <div class="label">Anlık Kişi Sayısı</div>
-        <div class="value">{current}</div>
+        <div class="value">0</div>
     </div>
     """, unsafe_allow_html=True)
 
-    total_placeholder.markdown(f"""
+    total_placeholder.markdown("""
     <div class="metric-card total">
         <div class="icon">📊</div>
         <div class="label">Toplam Sayım</div>
-        <div class="value">{total}</div>
+        <div class="value">0</div>
     </div>
     """, unsafe_allow_html=True)
 
-    if ctx.state.playing:
-        status_placeholder.markdown(f"""
-        <div class="metric-card fps">
-            <div class="icon">🔴</div>
-            <div class="label">Durum</div>
-            <div class="value" style="font-size:1.2rem;">CANLI</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        status_placeholder.markdown(f"""
-        <div class="metric-card">
-            <div class="icon">⏸️</div>
-            <div class="label">Durum</div>
-            <div class="value" style="font-size:1.2rem; background:linear-gradient(135deg,#64748b,#94a3b8);
-            -webkit-background-clip:text;-webkit-text-fill-color:transparent;">BEKLEMEDE</div>
-        </div>
-        """, unsafe_allow_html=True)
+    status_placeholder.markdown("""
+    <div class="metric-card">
+        <div class="icon">⏸️</div>
+        <div class="label">Durum</div>
+        <div class="value" style="font-size:1.2rem; background:linear-gradient(135deg,#64748b,#94a3b8);
+        -webkit-background-clip:text;-webkit-text-fill-color:transparent;">BEKLEMEDE</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Canlı veri güncelleme döngüsü
+    import time
+    while ctx.state.playing:
+        if ctx.video_processor:
+            with ctx.video_processor._lock:
+                current = ctx.video_processor.current_count
+                total = ctx.video_processor.total_count
+
+            current_placeholder.markdown(f"""
+            <div class="metric-card current">
+                <div class="icon">👥</div>
+                <div class="label">Anlık Kişi Sayısı</div>
+                <div class="value">{current}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            total_placeholder.markdown(f"""
+            <div class="metric-card total">
+                <div class="icon">📊</div>
+                <div class="label">Toplam Sayım</div>
+                <div class="value">{total}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            status_placeholder.markdown("""
+            <div class="metric-card fps">
+                <div class="icon">🔴</div>
+                <div class="label">Durum</div>
+                <div class="value" style="font-size:1.2rem;">CANLI</div>
+            </div>
+            """, unsafe_allow_html=True)
+        time.sleep(0.3)
 
 # Alt bilgi
 st.markdown("---")
