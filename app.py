@@ -2,6 +2,7 @@
 YOLO26 Real-Time Person Counter — Streamlit Web App
 =====================================================
 Tarayıcı üzerinden gerçek zamanlı insan tespiti ve sayımı.
+Streamlit Cloud & Lokal uyumlu.
 
 Çalıştırmak için:
     streamlit run app.py
@@ -13,10 +14,14 @@ import numpy as np
 import av
 import threading
 import time
+import os
+import logging
 from collections import OrderedDict
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 from ultralytics import YOLO
 from scipy.spatial import distance as dist
+
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # Sayfa Ayarları
@@ -27,6 +32,50 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ==============================================================================
+# ICE Server Yapılandırması (Streamlit Cloud için TURN desteği)
+# ==============================================================================
+def get_ice_servers():
+    """
+    Streamlit Cloud'da WebRTC bağlantısı için ICE sunucularını yapılandır.
+    Twilio TURN credentials varsa kullan, yoksa ücretsiz STUN + açık TURN sunucuları kullan.
+    """
+    # Yöntem 1: Twilio TURN (en güvenilir — Streamlit Secrets'ta ayarlanırsa)
+    try:
+        from twilio.rest import Client
+        account_sid = st.secrets.get("TWILIO_ACCOUNT_SID", os.environ.get("TWILIO_ACCOUNT_SID"))
+        auth_token = st.secrets.get("TWILIO_AUTH_TOKEN", os.environ.get("TWILIO_AUTH_TOKEN"))
+        if account_sid and auth_token:
+            client = Client(account_sid, auth_token)
+            token = client.tokens.create()
+            return token.ice_servers
+    except Exception as e:
+        logger.info(f"Twilio TURN kullanılamıyor: {e}")
+
+    # Yöntem 2: Ücretsiz açık STUN/TURN sunucuları
+    return [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+        {"urls": ["stun:stun3.l.google.com:19302"]},
+        {"urls": ["stun:stun4.l.google.com:19302"]},
+        {
+            "urls": "turn:openrelay.metered.ca:80",
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": "turn:openrelay.metered.ca:443",
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": "turn:openrelay.metered.ca:443?transport=tcp",
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+    ]
 
 # ==============================================================================
 # CSS Stili
@@ -179,6 +228,18 @@ st.markdown("""
         50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
     }
 
+    /* Cloud info box */
+    .cloud-info {
+        background: linear-gradient(145deg, #1e1b4b, #312e81);
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        border-radius: 12px;
+        padding: 16px;
+        margin: 16px 0;
+        font-size: 0.85rem;
+        color: #c7d2fe;
+    }
+    .cloud-info strong { color: #a5b4fc; }
+
     /* Streamlit varsayılan düzenlemeler */
     .stSlider > div > div > div { color: #6366f1; }
     div[data-testid="stMetric"] { background: transparent; }
@@ -328,9 +389,6 @@ class CentroidTracker:
                 prev_box = self.object_boxes.get(obj_id)
                 current_box = input_boxes[col]
 
-                # Düşük FPS durumunda (Streamlit Cloud sunucusunda) hareketler hızlı görünebilir.
-                # Eğer centroid uzaklığı max_distance'tan fazlaysa ama bounding box'lar 
-                # hâlâ kısmen çakışıyorsa (IoU > 0.05), bunu aynı kişi olarak eşleştir!
                 overlap = False
                 if prev_box is not None:
                     overlap = compute_iou(prev_box, current_box) > 0.05
@@ -398,9 +456,6 @@ class CentroidTracker:
                         self.deregister_candidate(cand_id)
 
         # --- Yeni aday kaydı ---
-        # AKILLI FİLTRE: Yeni tespit edilen bir kutu, hâlihazırda takip edilen 
-        # onaylanmış bir kişiye çok yakınsa (d < 100px) veya onunla çakışıyorsa (IoU > 0.1),
-        # mükerrer sayımı önlemek için yeni bir aday oluşturma!
         for col_idx in range(len(input_centroids)):
             if col_idx not in matched_input:
                 new_centroid = input_centroids[col_idx]
@@ -426,6 +481,7 @@ class CentroidTracker:
 # ==============================================================================
 @st.cache_resource
 def load_model(model_name):
+    """Modeli yükle. Streamlit Cloud'da ilk çalıştırmada otomatik indirilir."""
     return YOLO(model_name)
 
 
@@ -444,6 +500,7 @@ class PersonCounterProcessor(VideoProcessorBase):
         self.current_count = 0
         self.total_count = 0
         self._lock = threading.Lock()
+        self._frame_count = 0
 
     def draw_fancy_box(self, frame, x1, y1, x2, y2, obj_id):
         """Şık bounding box çiz."""
@@ -532,28 +589,46 @@ class PersonCounterProcessor(VideoProcessorBase):
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
-        h, w = img.shape[:2]
+        self._frame_count += 1
 
-        # YOLOv8 tespiti
-        results = self.model(img, verbose=False, conf=self.confidence)
+        # Streamlit Cloud'da performans için her 2. frame'de YOLO çalıştır
+        # (Cloud'da CPU-only, yavaş olabilir)
+        if self._frame_count % 2 == 0:
+            # YOLOv8 tespiti — düşük çözünürlükte çalıştır (performans)
+            h, w = img.shape[:2]
+            scale = min(416 / w, 416 / h)
+            small = cv2.resize(img, None, fx=scale, fy=scale)
+            
+            results = self.model(small, verbose=False, conf=self.confidence)
 
-        # Sadece 'person' sınıfı (class 0)
-        rects = []
-        for result in results:
-            for box in result.boxes:
-                if int(box.cls[0]) == 0:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    rects.append((x1, y1, x2, y2))
+            # Sadece 'person' sınıfı (class 0) — koordinatları orijinal boyuta çevir
+            rects = []
+            for result in results:
+                for box in result.boxes:
+                    if int(box.cls[0]) == 0:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        # Orijinal boyuta geri dönüştür
+                        x1 = int(x1 / scale)
+                        y1 = int(y1 / scale)
+                        x2 = int(x2 / scale)
+                        y2 = int(y2 / scale)
+                        rects.append((x1, y1, x2, y2))
 
-        # Çakışan kutuları kaldır (aynı kişi için birden fazla tespiti önle)
-        rects = remove_duplicate_boxes(rects, iou_threshold=0.4)
+            # Çakışan kutuları kaldır
+            rects = remove_duplicate_boxes(rects, iou_threshold=0.4)
 
-        # Tracker güncelle
-        objects = self.tracker.update(rects)
+            # Tracker güncelle
+            objects = self.tracker.update(rects)
 
-        with self._lock:
-            self.current_count = len(objects)
-            self.total_count = self.tracker.total_confirmed
+            with self._lock:
+                self.current_count = len(objects)
+                self.total_count = self.tracker.total_confirmed
+                self._last_rects = rects
+        else:
+            # Ara frame'lerde son durumu kullan
+            with self._lock:
+                rects = getattr(self, '_last_rects', [])
+            objects = self.tracker.objects
 
         # Her kişi için kutu çiz
         for (object_id, centroid) in objects.items():
@@ -624,17 +699,32 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## 🏷️ Model Bilgisi")
     st.markdown("""
-    - **Model:** YOLO26 Nano
+    - **Model:** YOLOv8 Nano
     - **Sınıf:** İnsan (person)
     - **Tracking:** Centroid-based
+    - **Onay:** 4 frame doğrulama
     """)
 
     st.markdown("---")
+
+    # Streamlit Cloud bilgi kutusu
+    st.markdown("""
+    <div class="cloud-info">
+        <strong>☁️ Streamlit Cloud Notu:</strong><br>
+        Cloud'da kamera bağlantısı WebRTC ile yapılır. 
+        Kamera izni verdikten sonra bağlantı kurulana kadar birkaç saniye bekleyin.
+        Eğer bağlantı kurulamazsa sayfayı yenileyin.
+    </div>
+    """, unsafe_allow_html=True)
+
     st.markdown(
         "<p style='text-align:center; color:#64748b; font-size:0.75rem;'>"
-        "YOLO26 Person Counter v1.0<br>Powered by Ultralytics & Streamlit</p>",
+        "YOLO26 Person Counter v1.1<br>Powered by Ultralytics & Streamlit</p>",
         unsafe_allow_html=True
     )
+
+# ICE sunucularını al
+ice_servers = get_ice_servers()
 
 # Ana içerik
 col_video, col_stats = st.columns([3, 1])
@@ -643,7 +733,7 @@ with col_video:
     st.markdown('<div class="video-container">', unsafe_allow_html=True)
 
     ctx = webrtc_streamer(
-        key="person-counter-v2",
+        key="person-counter-v3",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=PersonCounterProcessor,
         media_stream_constraints={
@@ -653,7 +743,7 @@ with col_video:
             },
             "audio": False,
         },
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        rtc_configuration={"iceServers": ice_servers},
         video_receiver_size=1,
         async_processing=True,
     )
@@ -697,7 +787,6 @@ with col_stats:
     """, unsafe_allow_html=True)
 
     # Canlı veri güncelleme döngüsü
-    import time
     while ctx.state.playing:
         if ctx.video_processor:
             with ctx.video_processor._lock:
