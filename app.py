@@ -229,64 +229,82 @@ def remove_duplicate_boxes(rects, iou_threshold=0.4):
 # Centroid Tracker (İyileştirilmiş — Onay Tabanlı Kayıt)
 # ==============================================================================
 class CentroidTracker:
-    def __init__(self, max_disappeared=50, max_distance=120, confirm_frames=3):
+    def __init__(self, max_disappeared=60, max_distance=250, confirm_frames=4):
         self.next_object_id = 0
         self.objects = OrderedDict()       # {id: centroid} — onaylı nesneler
+        self.object_boxes = OrderedDict()  # {id: bounding_box} — onaylı kutular
         self.disappeared = OrderedDict()   # {id: kaybolma sayacı}
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
 
-        # Onay mekanizması: Yeni bir tespit, 'confirm_frames' kez arka arkaya
-        # görülmeden toplam sayıma eklenmez. Bu, anlık yanlış tespitlerin
-        # toplam sayıyı şişirmesini önler.
+        # Onay mekanizması
         self.confirm_frames = confirm_frames
-        self.candidates = OrderedDict()    # {temp_id: centroid}
-        self.candidate_seen = OrderedDict()  # {temp_id: kaç frame görüldü}
+        self.candidates = OrderedDict()      # {temp_id: centroid}
+        self.candidate_boxes = OrderedDict()  # {temp_id: box}
+        self.candidate_seen = OrderedDict()   # {temp_id: kaç frame görüldü}
         self.next_candidate_id = 0
-        self.total_confirmed = 0           # Doğrulanmış toplam kişi
+        self.total_confirmed = 0             # Doğrulanmış toplam kişi sayısı
 
-    def _register_candidate(self, centroid):
+    def _register_candidate(self, centroid, box):
         """Yeni tespiti aday olarak kaydet."""
         self.candidates[self.next_candidate_id] = centroid
+        self.candidate_boxes[self.next_candidate_id] = box
         self.candidate_seen[self.next_candidate_id] = 1
         self.next_candidate_id += 1
 
     def _promote_candidate(self, cand_id):
         """Adayı onaylı nesne olarak terfi ettir."""
-        centroid = self.candidates[cand_id]
-        self.objects[self.next_object_id] = centroid
-        self.disappeared[self.next_object_id] = 0
-        self.next_object_id += 1
-        self.total_confirmed += 1
-        del self.candidates[cand_id]
-        del self.candidate_seen[cand_id]
+        if cand_id in self.candidates:
+            centroid = self.candidates[cand_id]
+            box = self.candidate_boxes[cand_id]
+            self.objects[self.next_object_id] = centroid
+            self.object_boxes[self.next_object_id] = box
+            self.disappeared[self.next_object_id] = 0
+            self.next_object_id += 1
+            self.total_confirmed += 1
+            self.deregister_candidate(cand_id)
 
     def register(self, centroid):
-        """Doğrudan kayıt (eski API uyumu için)."""
-        self._register_candidate(centroid)
+        """Eski API uyumu için."""
+        pass
+
+    def deregister_candidate(self, cand_id):
+        """Adayı sistemden sil."""
+        if cand_id in self.candidates:
+            del self.candidates[cand_id]
+        if cand_id in self.candidate_boxes:
+            del self.candidate_boxes[cand_id]
+        if cand_id in self.candidate_seen:
+            del self.candidate_seen[cand_id]
 
     def deregister(self, object_id):
-        del self.objects[object_id]
-        del self.disappeared[object_id]
+        """Onaylı nesneyi takipten çıkar."""
+        if object_id in self.objects:
+            del self.objects[object_id]
+        if object_id in self.object_boxes:
+            del self.object_boxes[object_id]
+        if object_id in self.disappeared:
+            del self.disappeared[object_id]
 
     def update(self, rects):
+        # Hiç tespit yoksa, mevcut nesnelerin kaybolma sayacını artır
         if len(rects) == 0:
-            # Mevcut nesnelerin kaybolma sayacını artır
             for object_id in list(self.disappeared.keys()):
                 self.disappeared[object_id] += 1
                 if self.disappeared[object_id] > self.max_disappeared:
                     self.deregister(object_id)
-            # Adayları da temizle
+            # Adayları da kademeli olarak sil
             for cand_id in list(self.candidate_seen.keys()):
                 self.candidate_seen[cand_id] -= 1
                 if self.candidate_seen[cand_id] <= 0:
-                    del self.candidates[cand_id]
-                    del self.candidate_seen[cand_id]
+                    self.deregister_candidate(cand_id)
             return self.objects
 
         input_centroids = np.zeros((len(rects), 2), dtype="int")
+        input_boxes = []
         for i, (x1, y1, x2, y2) in enumerate(rects):
             input_centroids[i] = (int((x1 + x2) / 2.0), int((y1 + y2) / 2.0))
+            input_boxes.append((x1, y1, x2, y2))
 
         # --- Onaylı nesnelerle eşleştir ---
         matched_input = set()
@@ -294,6 +312,8 @@ class CentroidTracker:
         if len(self.objects) > 0:
             object_ids = list(self.objects.keys())
             object_centroids = list(self.objects.values())
+            
+            # Uzaklık matrisi
             D = dist.cdist(np.array(object_centroids), input_centroids)
             rows = D.min(axis=1).argsort()
             cols = D.argmin(axis=1)[rows]
@@ -302,20 +322,35 @@ class CentroidTracker:
             for (row, col) in zip(rows, cols):
                 if row in used_rows or col in matched_input:
                     continue
-                if D[row, col] > self.max_distance:
+                
+                obj_id = object_ids[row]
+                prev_box = self.object_boxes.get(obj_id)
+                current_box = input_boxes[col]
+
+                # Düşük FPS durumunda (Streamlit Cloud sunucusunda) hareketler hızlı görünebilir.
+                # Eğer centroid uzaklığı max_distance'tan fazlaysa ama bounding box'lar 
+                # hâlâ kısmen çakışıyorsa (IoU > 0.05), bunu aynı kişi olarak eşleştir!
+                overlap = False
+                if prev_box is not None:
+                    overlap = compute_iou(prev_box, current_box) > 0.05
+
+                if D[row, col] > self.max_distance and not overlap:
                     continue
-                self.objects[object_ids[row]] = input_centroids[col]
-                self.disappeared[object_ids[row]] = 0
+                
+                self.objects[obj_id] = input_centroids[col]
+                self.object_boxes[obj_id] = input_boxes[col]
+                self.disappeared[obj_id] = 0
                 used_rows.add(row)
                 matched_input.add(col)
 
+            # Eşleşmeyen onaylı nesnelerin kaybolma sayacını artır
             for row in set(range(D.shape[0])).difference(used_rows):
-                object_id = object_ids[row]
-                self.disappeared[object_id] += 1
-                if self.disappeared[object_id] > self.max_disappeared:
-                    self.deregister(object_id)
+                obj_id = object_ids[row]
+                self.disappeared[obj_id] += 1
+                if self.disappeared[obj_id] > self.max_disappeared:
+                    self.deregister(obj_id)
 
-        # --- Kalan tespitleri adaylarla eşleştir ---
+        # --- Adaylarla eşleştir ---
         unmatched_inputs = [i for i in range(len(input_centroids)) if i not in matched_input]
 
         if len(self.candidates) > 0 and len(unmatched_inputs) > 0:
@@ -331,17 +366,25 @@ class CentroidTracker:
             for (cr, cc) in zip(c_rows, c_cols):
                 if cr in used_c_rows or cc in used_c_cols:
                     continue
-                if D_cand[cr, cc] > self.max_distance:
+                
+                cand_id = cand_ids[cr]
+                current_box = input_boxes[unmatched_inputs[cc]]
+                prev_cand_box = self.candidate_boxes.get(cand_id)
+
+                overlap = False
+                if prev_cand_box is not None:
+                    overlap = compute_iou(prev_cand_box, current_box) > 0.05
+
+                if D_cand[cr, cc] > self.max_distance and not overlap:
                     continue
 
-                cand_id = cand_ids[cr]
                 self.candidates[cand_id] = unmatched_centroids[cc]
+                self.candidate_boxes[cand_id] = current_box
                 self.candidate_seen[cand_id] += 1
                 used_c_rows.add(cr)
                 used_c_cols.add(cc)
                 matched_input.add(unmatched_inputs[cc])
 
-                # Yeterli frame görüldüyse onayla
                 if self.candidate_seen[cand_id] >= self.confirm_frames:
                     self._promote_candidate(cand_id)
 
@@ -351,13 +394,28 @@ class CentroidTracker:
                 if cand_id in self.candidate_seen:
                     self.candidate_seen[cand_id] -= 1
                     if self.candidate_seen[cand_id] <= 0:
-                        del self.candidates[cand_id]
-                        del self.candidate_seen[cand_id]
+                        self.deregister_candidate(cand_id)
 
-        # --- Hâlâ eşleşmeyen yeni tespitleri aday olarak kaydet ---
+        # --- Yeni aday kaydı ---
+        # AKILLI FİLTRE: Yeni tespit edilen bir kutu, hâlihazırda takip edilen 
+        # onaylanmış bir kişiye çok yakınsa (d < 100px) veya onunla çakışıyorsa (IoU > 0.1),
+        # mükerrer sayımı önlemek için yeni bir aday oluşturma!
         for col_idx in range(len(input_centroids)):
             if col_idx not in matched_input:
-                self._register_candidate(input_centroids[col_idx])
+                new_centroid = input_centroids[col_idx]
+                new_box = input_boxes[col_idx]
+                
+                is_duplicate = False
+                for obj_id, obj_centroid in self.objects.items():
+                    d = np.linalg.norm(new_centroid - obj_centroid)
+                    obj_box = self.object_boxes.get(obj_id)
+                    iou_val = compute_iou(obj_box, new_box) if obj_box else 0
+                    if d < 100 or iou_val > 0.1:
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    self._register_candidate(new_centroid, new_box)
 
         return self.objects
 
@@ -377,9 +435,9 @@ class PersonCounterProcessor(VideoProcessorBase):
     def __init__(self):
         self.model = load_model("yolov8n.pt")
         self.tracker = CentroidTracker(
-            max_disappeared=50,
-            max_distance=120,
-            confirm_frames=3
+            max_disappeared=60,
+            max_distance=250,
+            confirm_frames=4
         )
         self.confidence = 0.5
         self.current_count = 0
