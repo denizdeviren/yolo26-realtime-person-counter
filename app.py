@@ -12,8 +12,7 @@ import cv2
 import numpy as np
 import av
 import threading
-import random
-import mediapipe as mp
+import time
 from collections import OrderedDict
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 from ultralytics import YOLO
@@ -225,51 +224,6 @@ def remove_duplicate_boxes(rects, iou_threshold=0.4):
                 used.add(j)
 
     return keep
-
-
-# ==============================================================================
-# Hızlı Kalp Çizimi & Efekt Parçacıkları (Kasılma/Donma Önleyici)
-# ==============================================================================
-class HeartParticle:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.vx = random.uniform(-2, 2)
-        self.vy = random.uniform(-10, -6)
-        self.size = random.uniform(15, 30)
-        self.color = random.choice([
-            (100, 100, 255),  # Pembe (BGR)
-            (150, 120, 255),  # Açık Magenta
-            (80, 80, 255),    # Canlı Kırmızı
-            (120, 180, 255),  # Şeftali
-        ])
-        self.lifespan = random.randint(18, 25)  # Hızlı yükselip kaybolma
-        self.age = 0
-
-    def update(self):
-        self.x += self.vx
-        self.y += self.vy
-        self.age += 1
-        # Yaşlandıkça küçül
-        if self.age > self.lifespan * 0.5:
-            self.size *= 0.85
-
-
-def draw_fast_heart(img, cx, cy, size, color):
-    """Resim kopyalaması yapmadan 2 daire ve 1 üçgenle ultra hızlı, kasmayan kalp çizer."""
-    r = int(size / 4)
-    if r < 1:
-        r = 1
-    # Üst iki lob (Daireler)
-    cv2.circle(img, (int(cx - r), int(cy - r)), r, color, -1, cv2.LINE_AA)
-    cv2.circle(img, (int(cx + r), int(cy - r)), r, color, -1, cv2.LINE_AA)
-    # Alt sivri kısım (Üçgen)
-    pts = np.array([
-        [int(cx - 2*r), int(cy - r)],
-        [int(cx + 2*r), int(cy - r)],
-        [int(cx), int(cy + 2*r)]
-    ], np.int32)
-    cv2.fillPoly(img, [pts], color)
 
 
 # ==============================================================================
@@ -491,18 +445,6 @@ class PersonCounterProcessor(VideoProcessorBase):
         self.total_count = 0
         self._lock = threading.Lock()
 
-        # Kasma/donma önleyici MediaPipe Hands ayarları
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            max_num_hands=1,  # Sadece tek el takibi (kasmayı %50 azaltır)
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
-        )
-        self.particles = []
-        self.frame_counter = 0
-        self.heart_gesture_active = False
-        self.gesture_lost_timer = 0
-
     def draw_fancy_box(self, frame, x1, y1, x2, y2, obj_id):
         """Şık bounding box çiz."""
         # Renk paleti — her ID için farklı renk
@@ -630,85 +572,6 @@ class PersonCounterProcessor(VideoProcessorBase):
             # Centroid noktası
             cv2.circle(img, (int(centroid[0]), int(centroid[1])), 4, (241, 102, 99), -1)
             cv2.circle(img, (int(centroid[0]), int(centroid[1])), 6, (241, 102, 99), 1)
-
-        # ---------------------------------------------------------------------
-        # ULTRA HIZLI, KASMAYAN PARMAK KALP EFEKTİ (DİNAMİK JEST TAKİBİ)
-        # ---------------------------------------------------------------------
-        self.frame_counter += 1
-        gesture_detected_this_frame = False
-        hand_x, hand_y = 0, 0
-
-        # Kasmayı %90 önlemek için:
-        # 1. Her 3 karede bir el takibi yap (Gecikmesiz akış)
-        # 2. Resim boyutunu 240x180'e indir (CPU yükünü sıfıra indirir!)
-        if self.frame_counter % 3 == 0:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            small_rgb = cv2.resize(img_rgb, (240, 180), interpolation=cv2.INTER_LINEAR)
-            hand_results = self.hands.process(small_rgb)
-            
-            if hand_results.multi_hand_landmarks:
-                for hand_lms in hand_results.multi_hand_landmarks:
-                    # Orijinal resim ölçeğinde koordinatları geri oku
-                    def get_pt(idx):
-                        lm = hand_lms.landmark[idx]
-                        return int(lm.x * w), int(lm.y * h)
-                    
-                    try:
-                        x4, y4 = get_pt(4)    # Baş parmak ucu
-                        x8, y8 = get_pt(8)    # İşaret parmağı ucu
-                        x5, y5 = get_pt(5)    # İşaret parmağı eklemi
-                        x17, y17 = get_pt(17)  # Serçe parmağı eklemi
-                        
-                        # El boyutu referansı
-                        hand_size = np.sqrt((x5 - x17)**2 + (y5 - y17)**2)
-                        if hand_size == 0:
-                            hand_size = 1
-                            
-                        # Baş ve işaret parmak ucu arası mesafe
-                        tip_dist = np.sqrt((x4 - x8)**2 + (y4 - y8)**2)
-                        
-                        # Parmak uçları birbirine yakın mı? (Finger Heart koşulu 1)
-                        tips_touching = tip_dist < (hand_size * 0.28)
-                        
-                        # Diğer parmaklar kapalı mı? (MCP ekleminin altında mı?)
-                        middle_folded = get_pt(12)[1] > get_pt(10)[1]
-                        ring_folded = get_pt(16)[1] > get_pt(14)[1]
-                        pinky_folded = get_pt(20)[1] > get_pt(18)[1]
-                        
-                        if tips_touching and middle_folded and ring_folded and pinky_folded:
-                            gesture_detected_this_frame = True
-                            hand_x = int((x4 + x8) / 2)
-                            hand_y = int((y4 + y8) / 2)
-                            break  # Tek el kontrolü yeterli
-                    except Exception:
-                        pass
-
-        # Jest Durum Makinesi (State Machine)
-        if gesture_detected_this_frame:
-            self.heart_gesture_active = True
-            self.gesture_lost_timer = 20  # Jest bittikten sonra 1 saniye (20 kare) boyunca kalpler uçmaya devam etsin
-            
-            # Jest aktif olduğu sürece akıcı bir şekilde kalp üret
-            if self.frame_counter % 2 == 0:
-                for _ in range(2):
-                    self.particles.append(HeartParticle(hand_x, hand_y))
-        else:
-            # Jest o anda algılanmıyorsa (örn. el indirildiyse)
-            if self.gesture_lost_timer > 0:
-                self.gesture_lost_timer -= 1
-            else:
-                self.heart_gesture_active = False
-                self.particles = []  # Hareketi kestikten tam 1 saniye sonra tüm kalpleri yok et!
-
-        # Kalpleri çiz (Sadece jest aktifken veya sönümlenirken çizilir)
-        if self.heart_gesture_active:
-            active_particles = []
-            for p in self.particles:
-                p.update()
-                if p.age < p.lifespan:
-                    draw_fast_heart(img, p.x, p.y, p.size, p.color)
-                    active_particles.append(p)
-            self.particles = active_particles
 
         # Bilgi paneli
         self.draw_overlay(img, self.current_count, self.total_count)
